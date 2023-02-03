@@ -1,6 +1,6 @@
-(cl:in-package #:meow64)
+(cl:in-package #:meow64-macho)
 
-(defmacro define-some-structure ((structure maker) &rest fields)
+(defmacro define-some-structure (structure &rest fields &aux (maker (intern (format nil "PARSE-~a" structure))))
   (loop with extra-slots = (mapcar 'car (remove-if-not (lambda (y) (eq :extra (cadr y))) fields))
         for (name orepr obytes . irepr) in (remove-if (lambda (y) (eq :extra (cadr y))) fields)
         for integerp = (member orepr '(:signed :unsigned))
@@ -11,7 +11,7 @@
                               ,(if integerp
                                    `(+ ,@(loop for j below obytes 
                                                collect `(ash (aref array (+ i ,j))
-                                                             (ash ,j 3))))
+                                                             ,(ash j 3))))
                                    `(make-array
                                      ,obytes
                                      :element-type 'character
@@ -21,8 +21,8 @@
                             (incf i ,obytes))
         for translate-bytes = (ecase orepr
                                 ((:unsigned :string) grab-bytes)
-                                (:signed  `(let ((tmp ,grab-bytes))
-                                            (logior tmp (- (mask-field ,(byte 1 (1- (ash obytes 3))) tmp))))))
+                                (:signed `(let ((tmp ,grab-bytes))
+                                            (logior tmp (- (mask-field ',(byte 1 (1- (ash obytes 3))) tmp))))))
         unless constp
           collect name into fields
         collect `(,binder ,translate-bytes) into bindings
@@ -36,11 +36,15 @@
                            (t (error "unrecognised enumeration value ~a for ~a" ,binder ',name))))
                        (t (error "unrecognised irepr")))
                into initialisers
+        sum obytes into struct-size
         finally
            (return
              `(progn
                 (defstruct ,structure ,@fields ,@extra-slots)
+                (declaim (ftype (function ((simple-array (unsigned-byte 8) *) &optional (and fixnum (integer 0))) (values ,structure fixnum)) ,maker))
                 (defun ,maker (array &optional (i 0))
+                  (declare (type (and fixnum (integer 0)) i))
+                  (assert (< i (- (length array) ,struct-size)))
                   (let ,bindings
                     (assert (and ,@assertions))
                     (values
@@ -50,8 +54,8 @@
                               collect i))
                      i)))))))
 
-(macrolet ((define-header (struct parse magic &rest extra)
-             `(define-some-structure (,struct ,parse)
+(macrolet ((define-header (struct magic &rest extra)
+             `(define-some-structure ,struct
                 (magic :unsigned 4 :const ,magic)
                 ;; declared as signed in header but meh
                 (cputype :unsigned 4 :enum :x86 7
@@ -67,10 +71,10 @@
                 (sizeofcmds :unsigned 4)
                 (flags :unsigned 4)
                 ,@extra)))
-  (define-header mach-header-32 parse-mach-header-32 #xfeedface)
-  (define-header mach-header-64 parse-mach-header-64 #xfeedfacf (reserved :unsigned 4)))
+  (define-header header-32 #xfeedface)
+  (define-header header-64 #xfeedfacf (reserved :unsigned 4)))
                   
-(define-some-structure (load-command-header parse-load-command-header)
+(define-some-structure load-command-header
   (cmd :unsigned 4 :enum :segment            #x00000001
                          :symtab             #x00000002
                          :symseg             #x00000003
@@ -99,8 +103,8 @@
                          )
   (cmdsize :unsigned 4))
 
-(macrolet ((define-segment-command (struct parse size)
-             `(define-some-structure (,struct ,parse)
+(macrolet ((define-segment-command (struct size)
+             `(define-some-structure ,struct
                 (segname :string 16)
                 (vmaddr :unsigned ,size)
                 (vmsize :unsigned ,size)
@@ -112,11 +116,11 @@
                 (nsects :unsigned 4)
                 (flags :unsigned 4)
                 (sections :extra))))
-  (define-segment-command segment-command-32 parse-segment-command-32 4)
-  (define-segment-command segment-command-64 parse-segment-command-64 8))
+  (define-segment-command segment-command-32 4)
+  (define-segment-command segment-command-64 8))
 
-(macrolet ((define-section (struct parse size)
-             `(define-some-structure (,struct ,parse)
+(macrolet ((define-section (struct size)
+             `(define-some-structure ,struct
                 (sectname :string 16)
                 (segname :string 16)
                 (addr :unsigned ,size)
@@ -154,23 +158,44 @@
                 (reserved2 :unsigned 4)
                 ,@(if (= size 8) '((reserved3 :unsigned 4)) ())
                 (data :extra))))
-  (define-section section-32 parse-section-32 4)
-  (define-section section-64 parse-section-64 8))
+  (define-section section-32 4)
+  (define-section section-64 8))
 
-(define-some-structure (macho-dylib parse-macho-dylib)
+(define-some-structure dylib-command
   (offset :unsigned 4)
   (timestamp :unsigned 4)
   (current-version :unsigned 4)
   (compatibility-version :unsigned 4)
   (path-name :extra))
 
-(define-some-structure (macho-entry-point-command parse-macho-entry-point-command)
+(define-some-structure entry-point-command
   (entryoff :unsigned 8)
   (stacksize :unsigned 8))
 
-(define-some-structure (macho-dylinker-command parse-macho-dylinker-command)
+(define-some-structure dylinker-command
   (offset :unsigned 4)
   (name :extra))
+
+(define-some-structure symtab-command
+  (symoff :unsigned 4)
+  (nsyms :unsigned 4)
+  (stroff :unsigned 4)
+  (strsize :unsigned 4)
+  (syms :extra))
+
+(define-some-structure symtab-entry-32
+  (offset :unsigned 4)
+  (name :extra)
+  (type :unsigned 1)
+  (sect :unsigned 1) ; 0 => no sect; starts at 1 else
+  (desc :signed 2) ; ???
+  (value :unsigned 4))
+
+#|
+(define-some-structure dysymtab-command
+  . #.(loop for s in '(ilocalsym nlocalsym iextdefsym nextdefsym iundefsym nundefsym tocoff ntocmodtaboff nmodtab extrefsymoff nextrefsyms indirectsymoff nindirectsyms extreloff nextrel localreloff)
+            collect `(,s :unsigned 4)))
+|#
 
 (defun parse-segment-32 (array i)
   (loop with (segment-header i) = (multiple-value-list (parse-segment-command-32 array i))
@@ -181,6 +206,17 @@
         finally (setf (segment-command-32-sections segment-header) sects)
                 (return segment-header)))
 
+(defun parse-symtab-32 (array i)
+  (loop with symtab = (parse-symtab-command array i)
+        with i = (symtab-command-symoff symtab)
+        repeat (symtab-command-nsyms symtab)
+        for (entry ni) = (multiple-value-list (parse-symtab-entry-32 array i))
+        collect entry into entries
+        do (setf i ni
+                 (symtab-entry-32-name entry) (read-nul-terminated-string array (+ (symtab-entry-32-offset entry) (symtab-command-stroff symtab))))
+        finally (setf (symtab-command-syms symtab) entries)
+                (return symtab)))
+
 (defun read-nul-terminated-string (array i)
   (loop for j from i until (zerop (aref array j))
         finally (return (map 'string 'code-char (subseq array i j)))))
@@ -188,11 +224,11 @@
 (defun parse-structure-with-names (struct-constructor array i &rest fs)
   (loop with res = (funcall struct-constructor array i)
         for (get-offset set-string) on fs by 'cddr
-        ;; offset is from the start of load command, but i starts right after it; it is 8 bytes, so correct for that
+        ;; offset is from the start of load command, but our i starts right after it; it is 8 bytes, so correct for that
         do (funcall set-string (read-nul-terminated-string array (+ (funcall get-offset res) i -8)) res)
         finally (return res)))
 
-(defstruct macho32-file segments loaded-dylibs entry-point dylinker)
+(defstruct macho32-file segments symtabs loaded-dylibs entry-point dylinker)
 
 (defun parse-macho-32 (array)
   (multiple-value-bind (header i) (parse-mach-header-32 array)
@@ -202,17 +238,20 @@
           if (eq :segment (load-command-header-cmd lch))
             collect (parse-segment-32 array ni) into segments
           else if (eq :load-dylib (load-command-header-cmd lch))
-            collect (parse-structure-with-names 'parse-macho-dylib array ni 'macho-dylib-offset #'(setf macho-dylib-path-name)) into loaded-dylibs
+            collect (parse-structure-with-names 'parse-dylib-command array ni 'dylib-command-offset #'(setf dylib-command-path-name)) into loaded-dylibs
+          else if (eq :symtab (load-command-header-cmd lch))
+            collect (parse-symtab-32 array ni) into symtabs
           else if (eq :load-dylinker (load-command-header-cmd lch))
-            do (assert (null dylinker))
-               (setf dylinker (parse-structure-with-names 'parse-macho-dylinker-command array ni 'macho-dylinker-command-offset #'(setf macho-dylinker-command-name)))
+            do (assert (null dylinker)) ;there can only be one!
+               (setf dylinker (parse-structure-with-names 'parse-dylinker-command array ni 'dylinker-command-offset #'(setf dylinker-command-name)))
           else if (eq :main (load-command-header-cmd lch))
             do (assert (null entry-point))
-               (setf entry-point (parse-macho-entry-point-command array ni))
+               (setf entry-point (parse-entry-point-command array ni))
           else
             collect (load-command-header-cmd lch) into extras
           do (incf i (load-command-header-cmdsize lch))
           finally (return (values (make-macho32-file :segments segments
+                                                     :symtabs symtabs
                                                      :loaded-dylibs loaded-dylibs
                                                      :entry-point entry-point
                                                      :dylinker dylinker)
