@@ -7,18 +7,16 @@
         for stringp = (eq orepr :string)
         for constp = (and (consp irepr) (eq :const (car irepr)))
         for binder = (gensym (symbol-name name))
-        for grab-bytes = `(prog1
-                              ,(if integerp
-                                   `(+ ,@(loop for j below obytes 
-                                               collect `(ash (aref array (+ i ,j))
-                                                             ,(ash j 3))))
-                                   `(make-array
-                                     ,obytes
-                                     :element-type 'character
-                                     :initial-contents (list ,@(loop for j below obytes
-                                                                     collect `(code-char
-                                                                               (aref array (+ i ,j)))))))
-                            (incf i ,obytes))
+        for grab-bytes =(if integerp
+                            `(+ ,@(loop for j below obytes 
+                                        collect `(ash (aref array (+ i ,(+ j struct-size)))
+                                                      ,(ash j 3))))
+                            `(make-array
+                              ,obytes
+                              :element-type 'character
+                              :initial-contents (list ,@(loop for j below obytes
+                                                              collect `(code-char
+                                                                        (aref array (+ i ,(+ j struct-size))))))))
         for translate-bytes = (ecase orepr
                                 ((:unsigned :string) grab-bytes)
                                 (:signed `(let ((tmp ,grab-bytes))
@@ -52,7 +50,7 @@
                       ,@(loop for f in fields for i in initialisers
                               collect (intern (symbol-name f) :keyword)
                               collect i))
-                     i)))))))
+                     (+ i ,struct-size))))))))
 
 (macrolet ((define-header (struct magic &rest extra)
              `(define-some-structure ,struct
@@ -231,8 +229,8 @@
 (defstruct macho32-file segments symtabs loaded-dylibs entry-point dylinker)
 
 (defun parse-macho-32 (array)
-  (multiple-value-bind (header i) (parse-mach-header-32 array)
-    (loop repeat (mach-header-32-ncmds header)
+  (multiple-value-bind (header i) (parse-header-32 array)
+    (loop repeat (header-32-ncmds header)
           with entry-point and dylinker
           for (lch ni) = (multiple-value-list (parse-load-command-header array i))
           if (eq :segment (load-command-header-cmd lch))
