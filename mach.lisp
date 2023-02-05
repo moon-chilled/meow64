@@ -101,6 +101,12 @@
                          )
   (cmdsize :unsigned 4))
 
+(define-some-structure dyld-info
+  . #.(loop for s in '(rebase bind weak-bind lazy-bind export)
+            collect `(,(intern (format nil "~a-OFF" s)) :unsigned 4)
+            collect `(,(intern (format nil "~a-SIZE" s)) :unsigned 4)
+            collect `(,s :extra)))
+
 (macrolet ((define-segment-command (struct size)
              `(define-some-structure ,struct
                 (segname :string 16)
@@ -215,9 +221,10 @@
         finally (setf (symtab-command-syms symtab) entries)
                 (return symtab)))
 
-(defun read-nul-terminated-string (array i)
+(defun read-nul-terminated-string (array i &optional (f (constantly nil)))
   (loop for j from i until (zerop (aref array j))
-        finally (return (map 'string 'code-char (subseq array i j)))))
+        finally (funcall f j)
+                (return (map 'string 'code-char (subseq array i j)))))
 
 (defun parse-structure-with-names (struct-constructor array i &rest fs)
   (loop with res = (funcall struct-constructor array i)
@@ -226,25 +233,83 @@
         do (funcall set-string (read-nul-terminated-string array (+ (funcall get-offset res) i -8)) res)
         finally (return res)))
 
-(defstruct macho32-file segments symtabs loaded-dylibs entry-point dylinker)
+(defun parse-dyld-information (array i)
+  (labels ((read-uleb128 (array i f)
+             (loop for ni = i then (1+ ni)
+                   for shift = 0 then (+ 7 shift)
+                   for res = (logand #x7f (aref array ni)) then (+ res (ash (logand #x7f (aref array ni)) shift))
+                   while (logtest (aref array ni) #x80)
+                   finally (funcall f ni)
+                           (return res)))
+           (parse-binding-info (subseq)
+             (loop for i = 0 then (1+ i)
+                   with update-i = (lambda (ni) (setf i ni))
+                   while (< i (length subseq))
+                   for byte = (aref subseq i)
+                   for op = (ldb (byte 4 4) byte)
+                   for imm = (ldb (byte 4 0) byte)
+                   if (= 0 op) collect '(:done)
+                   else if (= 1 op) collect `(:set-dylib-ordinal ,imm)
+                   else if (= 4 op) collect `(:set-symbol-trailing-flags ,(read-nul-terminated-string subseq (1+ i) update-i)
+                                                                         ,@(if (logtest imm 1) '(:weak-import) ())
+                                                                         ,@(if (logtest imm 8) '(:non-weak-definition) ()))
+                   else if (= 5 op) collect `(:set-type ,(ecase imm
+                                                           (1 :pointer)
+                                                           (2 :text-absolute32)
+                                                           (3 :text-pcrel32)))
+                   else if (= 7 op) collect `(:set-segment-and-offset ,imm ,(read-uleb128 subseq (1+ i) update-i))
+                   else if (= 9 op) collect '(:do-bind)
+                          else do (error "bad op ~a" op)))
+           (parse-rebase-info (subseq)
+             (loop for i = 0 then (1+ i)
+                   with update-i = (lambda (ni) (setf i ni))
+                   while (< i (length subseq))
+                   for byte = (aref subseq i)
+                   for op = (ldb (byte 4 4) byte)
+                   for imm = (ldb (byte 4 0) byte)
+                   if (= 0 op) collect '(:done)
+                   else if (= 1 op) collect `(:set-type ,(ecase imm
+                                                           (1 :pointer)
+                                                           (2 :text-absolute32)
+                                                           (3 :text-pcrel32)))
+                   else if (= 2 op) collect `(:set-segment-and-offset ,imm ,(read-uleb128 subseq (1+ i) update-i))
+                   else if (= 5 op) collect `(:do-rebase ,imm)
+                   ;; I have absolutely no idea what the +4 is for, but dyldinfo does it...
+                   else if (= 7 op) collect `(:do-rebase-add-addr ,(+ 4 (read-uleb128 subseq (1+ i) update-i))))))
+    (let ((info (parse-dyld-info array i)))
+      (loop for target in '(bind lazy-bind weak-bind rebase)
+            for off = (intern (format nil "~a-OFF" target)) and size = (intern (format nil "~a-SIZE" target))
+            do (setf (slot-value info target) (funcall
+                                               (if (eq target 'rebase)
+                                                   #'parse-rebase-info
+                                                   #'parse-binding-info)
+                                               (subseq array (slot-value info off)
+                                                       (+ (slot-value info off) (slot-value info size))))))
+      info)))
+
+(defstruct macho32-file segments symtabs loaded-dylibs entry-point dyld-info dylinker)
 
 (defun parse-macho-32 (array)
   (multiple-value-bind (header i) (parse-header-32 array)
     (loop repeat (header-32-ncmds header)
-          with entry-point and dylinker
+          with entry-point and dylinker and dyld-info
           for (lch ni) = (multiple-value-list (parse-load-command-header array i))
-          if (eq :segment (load-command-header-cmd lch))
+          for cmd = (load-command-header-cmd lch)
+          if (eq :segment cmd)
             collect (parse-segment-32 array ni) into segments
-          else if (eq :load-dylib (load-command-header-cmd lch))
+          else if (eq :load-dylib cmd)
             collect (parse-structure-with-names 'parse-dylib-command array ni 'dylib-command-offset #'(setf dylib-command-path-name)) into loaded-dylibs
-          else if (eq :symtab (load-command-header-cmd lch))
+          else if (eq :symtab cmd)
             collect (parse-symtab-32 array ni) into symtabs
-          else if (eq :load-dylinker (load-command-header-cmd lch))
+          else if (eq :load-dylinker cmd)
             do (assert (null dylinker)) ;there can only be one!
                (setf dylinker (parse-structure-with-names 'parse-dylinker-command array ni 'dylinker-command-offset #'(setf dylinker-command-name)))
-          else if (eq :main (load-command-header-cmd lch))
+          else if (eq :main cmd)
             do (assert (null entry-point))
                (setf entry-point (parse-entry-point-command array ni))
+          else if (eq :dyld-info-only cmd)
+            do (assert (null dyld-info))
+               (setf dyld-info (parse-dyld-information array ni))
           else
             collect (load-command-header-cmd lch) into extras
           do (incf i (load-command-header-cmdsize lch))
@@ -252,6 +317,7 @@
                                                      :symtabs symtabs
                                                      :loaded-dylibs loaded-dylibs
                                                      :entry-point entry-point
+                                                     :dyld-info dyld-info
                                                      :dylinker dylinker)
                                   extras)))))
     
