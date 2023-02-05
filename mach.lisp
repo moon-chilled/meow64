@@ -1,5 +1,9 @@
 (cl:in-package #:meow64-macho)
 
+;; https://github.com/aidansteele/osx-abi-macho-file-format-reference
+;; http://networkpx.blogspot.com/2009/09/about-lcdyldinfoonly-command.html
+;; and various apple sources/headers
+
 (defmacro define-some-structure (structure &rest fields &aux (maker (intern (format nil "PARSE-~a" structure))))
   (loop with extra-slots = (mapcar 'car (remove-if-not (lambda (y) (eq :extra (cadr y))) fields))
         for (name orepr obytes . irepr) in (remove-if (lambda (y) (eq :extra (cadr y))) fields)
@@ -234,7 +238,7 @@
         finally (return res)))
 
 (defun parse-dyld-information (array i)
-  (labels ((read-uleb128 (array i f)
+  (labels ((read-uleb128 (array i &optional (f (constantly nil)))
              (loop for ni = i then (1+ ni)
                    for shift = 0 then (+ 7 shift)
                    for res = (logand #x7f (aref array ni)) then (+ res (ash (logand #x7f (aref array ni)) shift))
@@ -275,14 +279,33 @@
                    else if (= 2 op) collect `(:set-segment-and-offset ,imm ,(read-uleb128 subseq (1+ i) update-i))
                    else if (= 5 op) collect `(:do-rebase ,imm)
                    ;; I have absolutely no idea what the +4 is for, but dyldinfo does it...
-                   else if (= 7 op) collect `(:do-rebase-add-addr ,(+ 4 (read-uleb128 subseq (1+ i) update-i))))))
+                   else if (= 7 op) collect `(:do-rebase-add-addr ,(+ 4 (read-uleb128 subseq (1+ i) update-i)))))
+           (parse-exports (subseq &optional (i 0) (prefix ""))
+             (loop with terminal-size = (aref subseq i)
+                   ;; address is supposed to get added to a base address (which...?  Text's?)
+                   with terminal = (if (zerop terminal-size)
+                                       nil
+                                       (let* (ti
+                                              (flags (read-uleb128 subseq (1+ i) (lambda (ni) (setf ti (1+ ni)))))
+                                              (address (read-uleb128 subseq ti)))
+                                         (list prefix address flags)))
+                               
+                   with childi = (+ i terminal-size 2)
+                   with nchild = (progn (format t "i ~a nc ~a~%" (1- childi) (aref subseq (1- childi))) (aref subseq (1- childi)))
+                   repeat nchild
+                   for nsuffix = (read-nul-terminated-string subseq childi (lambda (ni) (setf childi (1+ ni))))
+                   for ci = (read-uleb128 subseq childi (lambda (ni) (setf childi (1+ ni))))
+                   append (parse-exports subseq ci (concatenate 'string prefix nsuffix)) into res
+                   finally (return (if terminal (cons terminal res) res)))))
+                   
     (let ((info (parse-dyld-info array i)))
-      (loop for target in '(bind lazy-bind weak-bind rebase)
+      (loop for target in '(bind lazy-bind weak-bind rebase export)
             for off = (intern (format nil "~a-OFF" target)) and size = (intern (format nil "~a-SIZE" target))
             do (setf (slot-value info target) (funcall
-                                               (if (eq target 'rebase)
-                                                   #'parse-rebase-info
-                                                   #'parse-binding-info)
+                                               (cond
+                                                 ((eq target 'rebase) #'parse-rebase-info)
+                                                 ((eq target 'export) #'parse-exports)
+                                                 (t #'parse-binding-info))
                                                (subseq array (slot-value info off)
                                                        (+ (slot-value info off) (slot-value info size))))))
       info)))
