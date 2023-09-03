@@ -261,6 +261,8 @@
                                                            (1 :pointer)
                                                            (2 :text-absolute32)
                                                            (3 :text-pcrel32)))
+                   ;; todo sleb128 set addend
+                   else if (= 6 op) (read-uleb128 subseq (1+ i) update-i)
                    else if (= 7 op) collect `(:set-segment-and-offset ,imm ,(read-uleb128 subseq (1+ i) update-i))
                    else if (= 9 op) collect '(:do-bind)
                           else do (error "bad op ~a" op)))
